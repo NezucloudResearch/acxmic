@@ -41,7 +41,7 @@ Built and tested in a Hyper-V VM (Windows 11 26100, 2 vCPUs, test-signing). All 
 | What | Result |
 | --- | --- |
 | Idle (device enabled, nobody records) | 0 timer ticks in 30 s: no timer, no thread, nothing scheduled |
-| While an app records | one timer pass per packet, about 100 per second; a pass takes 10-25 us on average (max 0.3-0.7 ms), which is 0.1-0.25 % of one core; a write takes 1-3 us on average |
+| While an app records | one timer pass per packet, about 100 per second; a pass takes 6-25 us on average (max 0.3-0.7 ms), which is 0.06-0.25 % of one core; a write takes 0.4-3 us on average |
 | Timer lateness | 0.3 ms on average; max 1.0-2.1 ms in most runs, one 10 ms outlier in about 12 runs of 30 s |
 | Write-to-recording latency | median 18.8 ms (a 20 ms cushion that is refilled at once) |
 | Quality | 999.97 Hz measured for a 1000 Hz tone over 30 s, 0 dropouts in six runs; an earlier 30 s run had two gaps while the VM was busy, cause not proven |
