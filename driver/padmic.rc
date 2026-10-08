@@ -1,0 +1,17 @@
+// PadDisplay by Nezucloud. Copyright (c) 2026 Nezucloud.
+// SPDX-License-Identifier: MIT
+#include <windows.h>
+#include <ntverp.h>
+
+#define VER_FILETYPE VFT_DRV
+#define VER_FILESUBTYPE VFT2_DRV_SYSTEM
+#define VER_FILEDESCRIPTION_STR "PadDisplay Virtual Microphone driver"
+#define VER_INTERNALNAME_STR "padmic.sys"
+#define VER_ORIGINALFILENAME_STR "padmic.sys"
+#define VER_LEGALCOPYRIGHT_STR "Copyright (c) 2026 Nezucloud"
+#undef VER_COMPANYNAME_STR
+#define VER_COMPANYNAME_STR "Nezucloud"
+#undef VER_PRODUCTNAME_STR
+#define VER_PRODUCTNAME_STR "PadDisplay"
+
+#include "common.ver"

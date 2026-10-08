@@ -1,0 +1,5 @@
+out/
+*.obj
+*.pdb
+*.res
+*.cer
