@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <avrt.h>
 
 #include "padmic_public.h"
 
@@ -118,8 +119,14 @@ struct Capture {
     }
 };
 
+// How late the tone writer woke up, to tell a harness stall (the VM, the scheduler) from a driver problem when the recording has a gap.
+static double g_writerLateMaxMs = 0;
+static int g_writerLate5 = 0, g_writerLate15 = 0;
+
 // The QPC the audio engine reports uses the same 100 ns clock as QueryPerformanceCounter converted to 100 ns units.
 static void Tone(HANDLE dev, double seconds, double freq, std::atomic<bool>& done) {
+    DWORD task = 0;
+    AvSetMmThreadCharacteristicsW(L"Pro Audio", &task); // like PadDisplay.exe's own writer thread
     const int perPacket = 480;
     double phase = 0;
     const double start = Qpc() + 0.05;
@@ -127,6 +134,10 @@ static void Tone(HANDLE dev, double seconds, double freq, std::atomic<bool>& don
     std::vector<int16_t> buf(perPacket);
     for (int i = 0; i < packets; ++i) {
         SleepUntil(start + i * 0.01);
+        const double lateMs = (Qpc() - (start + i * 0.01)) * 1000.0;
+        g_writerLateMaxMs = std::max(g_writerLateMaxMs, lateMs);
+        if (lateMs > 5) ++g_writerLate5;
+        if (lateMs > 15) ++g_writerLate15;
         for (int k = 0; k < perPacket; ++k) {
             buf[k] = int16_t(std::sin(phase) * 0.5 * 32767);
             phase += 2 * 3.14159265358979 * freq / 48000.0;
@@ -137,10 +148,24 @@ static void Tone(HANDLE dev, double seconds, double freq, std::atomic<bool>& don
     done = true;
 }
 
+// What the driver itself measured: the cost of its timer ticks (DISPATCH_LEVEL) and of the write handler, and how late the
+// timer ran each tick. busy/late are per tick; the cpu figure is busy time over the time the ticks cover (10 ms each).
+static void PrintTiming(const PADMIC_STATUS& st) {
+    if (st.Version < 2 || st.QpcFrequency == 0) { printf("driver timing: not available (interface version %u)\n", st.Version); return; }
+    const double us = 1e6 / double(st.QpcFrequency);
+    const double ticks = double(st.Ticks ? st.Ticks : 1), writes = double(st.Writes ? st.Writes : 1);
+    printf("driver timing: %llu ticks: busy avg %.2f us, max %.1f us; late avg %.1f us, max %.1f us, %llu later than 2 ms; cpu %.4f %% of one core at 100 ticks/s\n",
+           st.Ticks, st.TickBusyTotal * us / ticks, st.TickBusyMax * us, st.TickLateTotal * us / ticks, st.TickLateMax * us, st.LateTicks,
+           st.TickBusyTotal * us / ticks * 100.0 / 1e6 * 100.0);
+    printf("driver timing: %llu writes: busy avg %.2f us, max %.1f us\n", st.Writes, st.WriteBusyTotal * us / writes, st.WriteBusyMax * us);
+}
+
 // external = somebody else (PadDisplay.exe) writes the tone: only record and analyse.
 static int SelfTest(double seconds, double freq, bool external = false) {
     HANDLE dev = external ? INVALID_HANDLE_VALUE : OpenDevice();
     if (!external && dev == INVALID_HANDLE_VALUE) { printf("cannot open the control device: %lu\n", GetLastError()); return 1; }
+    PADMIC_STATUS before{};
+    if (!external) { DWORD n = 0; DeviceIoControl(dev, IOCTL_PADMIC_GET_STATUS, nullptr, 0, &before, sizeof(before), &n, nullptr); }
     Capture cap;
     std::thread ct([&] { cap.Run(); });
     while (!cap.ready) Sleep(10);
@@ -200,6 +225,10 @@ static int SelfTest(double seconds, double freq, bool external = false) {
     const double sentSeconds = seconds;
     const double gotSeconds = double(st.SamplesRead) / 48000.0;
     printf("driver read %.2f s of audio while %.2f s were written (the difference is the idle part before and after)\n", gotSeconds, sentSeconds);
+    PrintTiming(st);
+    if (!external)
+        printf("this run only: underruns +%u, drops +%u; the writer woke up late: max %.1f ms, %d times over 5 ms, %d over 15 ms (the ring's cushion is 20 ms)\n",
+               st.Underruns - before.Underruns, st.Drops - before.Drops, g_writerLateMaxMs, g_writerLate5, g_writerLate15);
     return (std::fabs(measured - freq) < 2.0 && runs == 0) ? 0 : 3;
 }
 
@@ -254,6 +283,44 @@ static int Latency(int impulses) {
     return lat.empty() ? 2 : 0;
 }
 
+// Starts and stops a recording `n` times (each lasting `holdMs`) while a tone is written all the time: finds leaks and
+// state bugs in the stream create/run/pause/destroy path. Prints the driver counters at the end.
+static int Cycles(int n, int holdMs) {
+    HANDLE dev = OpenDevice();
+    if (dev == INVALID_HANDLE_VALUE) { printf("cannot open the control device: %lu\n", GetLastError()); return 1; }
+    std::atomic<bool> stopWriter{false};
+    std::thread writer([&] {
+        std::vector<int16_t> buf(480, 1000);
+        const double start = Qpc();
+        for (long i = 0; !stopWriter; ++i) {
+            SleepUntil(start + i * 0.01);
+            DWORD w = 0;
+            WriteFile(dev, buf.data(), 960, &w, nullptr);
+        }
+    });
+    int failed = 0;
+    for (int i = 0; i < n; ++i) {
+        Capture cap;
+        std::thread ct([&] { cap.Run(); });
+        while (!cap.ready) Sleep(5);
+        if (!cap.error.empty()) { ++failed; printf("cycle %d: %s\n", i, cap.error.c_str()); }
+        else Sleep(holdMs);
+        cap.stop = true;
+        ct.join();
+    }
+    Sleep(300);
+    stopWriter = true;
+    writer.join();
+    PADMIC_STATUS st{};
+    DWORD got = 0;
+    DeviceIoControl(dev, IOCTL_PADMIC_GET_STATUS, nullptr, 0, &st, sizeof(st), &got, nullptr);
+    printf("cycles: %d done, %d failed. streams created %u destroyed %u, runs %u pauses %u, destroyedWhileRunning %u, running now %u, underruns %u, drops %u\n",
+           n, failed, st.StreamsCreated, st.StreamsDestroyed, st.Runs, st.Pauses, st.DestroyedWhileRunning, st.StreamsRunning, st.Underruns, st.Drops);
+    PrintTiming(st);
+    CloseHandle(dev);
+    return failed ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     std::string mode = argc > 1 ? argv[1] : "";
@@ -267,6 +334,7 @@ int main(int argc, char** argv) {
                st.RingFillSamples, st.StreamsRunning, st.Primed, st.Underruns, st.Drops, st.SamplesWritten, st.SamplesRead);
         printf("streams created %u destroyed %u, runs %u pauses %u, destroyedWhileRunning %u, ticks %llu\n", st.StreamsCreated, st.StreamsDestroyed,
                st.Runs, st.Pauses, st.DestroyedWhileRunning, st.Ticks);
+        PrintTiming(st);
         CloseHandle(dev);
         return ok ? 0 : 1;
     }
@@ -287,6 +355,7 @@ int main(int argc, char** argv) {
     if (mode == "record") return SelfTest(argc > 2 ? atof(argv[2]) : 10, argc > 3 ? atof(argv[3]) : 1000, true);
     if (mode == "selftest") return SelfTest(argc > 2 ? atof(argv[2]) : 10, argc > 3 ? atof(argv[3]) : 1000);
     if (mode == "latency") return Latency(argc > 2 ? atoi(argv[2]) : 5);
-    printf("usage: padmic_test status | open | hold <s> | selftest <s> <hz> | latency <n>\n");
+    if (mode == "cycles") return Cycles(argc > 2 ? atoi(argv[2]) : 20, argc > 3 ? atoi(argv[3]) : 500);
+    printf("usage: padmic_test status | open | hold <s> | selftest <s> <hz> | latency <n> | cycles <n> <ms>\n");
     return 64;
 }

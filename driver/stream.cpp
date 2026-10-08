@@ -67,7 +67,8 @@ CPadMicStream::CPadMicStream(_In_ ACXSTREAM Stream, _In_ ACXDATAFORMAT Format)
       m_Format(Format),
       m_StartTime(0),
       m_StartPosition(0),
-      m_GlitchAdjust(0) {
+      m_GlitchAdjust(0),
+      m_DueQpc(0) {
     InterlockedIncrement(&g_Stats.Created);
     KeQueryPerformanceCounter(&m_QpcFrequency);
     m_CurrentPacketStart.QuadPart = 0;
@@ -240,7 +241,14 @@ NTSTATUS CPadMicStream::GetCapturePacket(_Out_ ULONG* LastCapturePacket, _Out_ U
 VOID CPadMicStream::s_EvtTimer(_In_ WDFTIMER Timer) { GetPadMicTimerContext(Timer)->Engine->PassCallback(); }
 
 VOID CPadMicStream::PassCallback() {
+    const LONGLONG started = KeQueryPerformanceCounter(nullptr).QuadPart;
     InterlockedIncrement64(&g_Stats.Ticks);
+    const LONGLONG late = started - m_DueQpc;
+    if (late > 0) {
+        InterlockedAdd64(&g_Stats.TickLateTotal, late);
+        PadMicStatMax(&g_Stats.TickLateMax, late);
+        if (late * 500 > g_Stats.QpcFrequency) InterlockedIncrement64(&g_Stats.LateTicks); // later than 2 ms
+    }
     ProcessPacket();
 
     const ULONGLONG completed = static_cast<ULONG>(InterlockedIncrement(reinterpret_cast<LONG*>(&m_CurrentPacket))) - 1;
@@ -249,6 +257,9 @@ VOID CPadMicStream::PassCallback() {
     InterlockedExchange64(&m_CurrentPacketStart.QuadPart, static_cast<LONGLONG>(qpc));
 
     (VOID)AcxRtStreamNotifyPacketComplete(m_Stream, completed, qpc);
+    const LONGLONG busy = KeQueryPerformanceCounter(nullptr).QuadPart - started;
+    InterlockedAdd64(&g_Stats.TickBusyTotal, busy);
+    PadMicStatMax(&g_Stats.TickBusyMax, busy);
     ScheduleNextPass();
 }
 
@@ -259,15 +270,18 @@ VOID CPadMicStream::ScheduleNextPass() {
     const ULONGLONG nextPacketStart = static_cast<ULONGLONG>(m_CurrentPacket + 1) * m_PacketSize;
     const ULONGLONG sinceResume = nextPacketStart - m_StartPosition;
     const ULONGLONG nextTime = m_StartTime + m_GlitchAdjust + sinceResume * kHnsPerSec / bytesPerSecond;
-    const ULONGLONG now = KSCONVERT_PERFORMANCE_TIME(m_QpcFrequency.QuadPart, KeQueryPerformanceCounter(nullptr));
+    const LARGE_INTEGER nowQpc = KeQueryPerformanceCounter(nullptr);
+    const ULONGLONG now = KSCONVERT_PERFORMANCE_TIME(m_QpcFrequency.QuadPart, nowQpc);
 
     const LONGLONG delay = -static_cast<LONGLONG>(nextTime - now); // negative = relative
     if (delay >= 0) {
         // We are late (the system stalled): skip the lost time and deliver the packet right away.
         m_GlitchAdjust += delay;
+        m_DueQpc = nowQpc.QuadPart; // not counted as a late tick: the pass runs at once
         PassCallback();
         return;
     }
+    m_DueQpc = nowQpc.QuadPart + (-delay) * m_QpcFrequency.QuadPart / kHnsPerSec;
     WdfTimerStart(m_Timer, delay);
 }
 

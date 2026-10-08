@@ -98,7 +98,12 @@ VOID EvtControlWrite(WDFQUEUE, WDFREQUEST Request, size_t Length) {
         WdfRequestComplete(Request, status);
         return;
     }
+    const LONGLONG t0 = KeQueryPerformanceCounter(nullptr).QuadPart;
     g_Ring.Write(static_cast<const SHORT*>(buffer), static_cast<ULONG>(Length / sizeof(SHORT)));
+    const LONGLONG busy = KeQueryPerformanceCounter(nullptr).QuadPart - t0;
+    InterlockedIncrement64(&g_Stats.Writes);
+    InterlockedAdd64(&g_Stats.WriteBusyTotal, busy);
+    PadMicStatMax(&g_Stats.WriteBusyMax, busy);
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, Length);
 }
 
@@ -107,8 +112,12 @@ VOID EvtControlIoctl(WDFQUEUE, WDFREQUEST Request, size_t OutputBufferLength, si
     NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
     size_t info = 0;
     if (IoControlCode == IOCTL_PADMIC_GET_STATUS) {
-        PADMIC_STATUS* out = nullptr;
-        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(PADMIC_STATUS), reinterpret_cast<PVOID*>(&out), nullptr);
+        // Version 1 callers pass the smaller structure; they get the part they know.
+        PADMIC_STATUS full{};
+        PADMIC_STATUS* out = &full;
+        PVOID callerBuffer = nullptr;
+        size_t callerSize = 0;
+        status = WdfRequestRetrieveOutputBuffer(Request, PADMIC_STATUS_V1_SIZE, &callerBuffer, &callerSize);
         if (NT_SUCCESS(status)) {
             ULONG fill, running, primed, underruns, drops;
             ULONGLONG written, read;
@@ -127,7 +136,17 @@ VOID EvtControlIoctl(WDFQUEUE, WDFREQUEST Request, size_t OutputBufferLength, si
             out->Pauses = static_cast<unsigned int>(g_Stats.Pauses);
             out->DestroyedWhileRunning = static_cast<unsigned int>(g_Stats.DestroyedWhileRunning);
             out->Ticks = static_cast<unsigned long long>(g_Stats.Ticks);
-            info = sizeof(PADMIC_STATUS);
+            out->QpcFrequency = static_cast<unsigned long long>(g_Stats.QpcFrequency);
+            out->TickBusyTotal = static_cast<unsigned long long>(g_Stats.TickBusyTotal);
+            out->TickBusyMax = static_cast<unsigned long long>(g_Stats.TickBusyMax);
+            out->TickLateTotal = static_cast<unsigned long long>(g_Stats.TickLateTotal);
+            out->TickLateMax = static_cast<unsigned long long>(g_Stats.TickLateMax);
+            out->LateTicks = static_cast<unsigned long long>(g_Stats.LateTicks);
+            out->Writes = static_cast<unsigned long long>(g_Stats.Writes);
+            out->WriteBusyTotal = static_cast<unsigned long long>(g_Stats.WriteBusyTotal);
+            out->WriteBusyMax = static_cast<unsigned long long>(g_Stats.WriteBusyMax);
+            info = callerSize < sizeof(PADMIC_STATUS) ? callerSize : sizeof(PADMIC_STATUS);
+            RtlCopyMemory(callerBuffer, out, info);
         }
     } else if (IoControlCode == IOCTL_PADMIC_RESET) {
         g_Ring.Reset();
@@ -191,6 +210,9 @@ extern "C" DRIVER_INITIALIZE DriverEntry;
 
 extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath) {
     g_Ring.Init();
+    LARGE_INTEGER frequency;
+    KeQueryPerformanceCounter(&frequency);
+    g_Stats.QpcFrequency = frequency.QuadPart;
 
     WDF_DRIVER_CONFIG wdfCfg;
     WDF_DRIVER_CONFIG_INIT(&wdfCfg, PadMic_EvtDeviceAdd);

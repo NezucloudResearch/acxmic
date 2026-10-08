@@ -50,7 +50,22 @@ PVOID operator new(size_t size, POOL_FLAGS flags, ULONG tag);
 struct PadMicStats {
     volatile LONG Created, Destroyed, Runs, Pauses, DestroyedWhileRunning;
     volatile LONG64 Ticks;
+    // Timing (QPC counts), see PADMIC_STATUS. Written with interlocked operations: a stream timer and the writer run on
+    // different CPUs, but never contend for more than these few cache lines.
+    LONG64 QpcFrequency;
+    volatile LONG64 TickBusyTotal, TickBusyMax, TickLateTotal, TickLateMax, LateTicks;
+    volatile LONG64 Writes, WriteBusyTotal, WriteBusyMax;
 };
+
+// Raises *target to v if v is larger.
+inline VOID PadMicStatMax(volatile LONG64* target, LONG64 v) {
+    LONG64 cur = *target;
+    while (v > cur) {
+        const LONG64 prev = InterlockedCompareExchange64(target, v, cur);
+        if (prev == cur) break;
+        cur = prev;
+    }
+}
 extern PadMicStats g_Stats;
 
 // The one ring every stream reads and the control device writes (there is one microphone).
@@ -114,6 +129,7 @@ private:
     ULONGLONG m_StartTime;
     ULONGLONG m_StartPosition;
     ULONGLONG m_GlitchAdjust;
+    LONGLONG m_DueQpc;     // when the timer is due to run the next pass (QPC), to measure how late it ran
     LARGE_INTEGER m_QpcFrequency;
     LARGE_INTEGER m_CurrentPacketStart;
     LARGE_INTEGER m_LastPacketStart;

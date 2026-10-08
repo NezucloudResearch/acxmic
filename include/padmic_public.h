@@ -12,7 +12,7 @@
 #define PADMIC_MAX_WRITE_BYTES 16384u
 
 // Version of this interface; PADMIC_STATUS::Version reports the driver's.
-#define PADMIC_INTERFACE_VERSION 1u
+#define PADMIC_INTERFACE_VERSION 2u
 
 #define PADMIC_CTL(code, access) (((0x22u) << 16) | ((access) << 14) | ((code) << 2)) // FILE_DEVICE_UNKNOWN, METHOD_BUFFERED
 #define IOCTL_PADMIC_GET_STATUS PADMIC_CTL(0x800u, 1u)  // FILE_READ_ACCESS: out = PADMIC_STATUS
@@ -35,4 +35,18 @@ struct PADMIC_STATUS {
     unsigned int Pauses;
     unsigned int DestroyedWhileRunning;
     unsigned long long Ticks;
+    // Version 2: what the driver costs, for finding bottlenecks. Times are QueryPerformanceCounter counts (QpcFrequency per second).
+    // A tick is one pass of the stream timer (one packet, normally 10 ms): "busy" is the time the pass itself takes at
+    // DISPATCH_LEVEL, "late" is how long after its due time the timer actually ran it. LateTicks counts ticks later than 2 ms.
+    unsigned long long QpcFrequency;
+    unsigned long long TickBusyTotal;
+    unsigned long long TickBusyMax;
+    unsigned long long TickLateTotal;
+    unsigned long long TickLateMax;
+    unsigned long long LateTicks;
+    unsigned long long Writes;          // WriteFile calls to the control device
+    unsigned long long WriteBusyTotal;  // time inside the write handler
+    unsigned long long WriteBusyMax;
 };
+// Size of the version 1 structure: a program built against version 1 passes this much, and still gets a valid answer.
+#define PADMIC_STATUS_V1_SIZE 72u
