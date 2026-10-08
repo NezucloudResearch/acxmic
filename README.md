@@ -13,9 +13,13 @@ The names (`Root\PadDisplayMic`, `\.\PadDisplayMic`, the endpoint name) are PadD
 
 ## Use it
 
-The control device is `\.\PadDisplayMic`. Open it with `CreateFile` (overlapped is fine), then `WriteFile` s16 mono PCM at 48 kHz, up to 16384 bytes per write. `IOCTL_PADMIC_GET_STATUS` returns the counters, `IOCTL_PADMIC_RESET` empties the buffer. Everything is declared in [`include/padmic_public.h`](include/padmic_public.h), the header consumers include.
+The control device is `\.\PadDisplayMic`. Open it with `CreateFile` (overlapped is fine), then `WriteFile` s16 mono PCM at 48 kHz, up to 16384 bytes per write. `IOCTL_PADMIC_GET_STATUS` returns the counters (interface version 2 adds what the driver itself spent, see below; a caller built for version 1 passes `PADMIC_STATUS_V1_SIZE` and still gets a valid answer), `IOCTL_PADMIC_RESET` empties the buffer. Everything is declared in [`include/padmic_public.h`](include/padmic_public.h), the header consumers include.
 
 Installing: create the root-enumerated device `Root\PadDisplayMic` (class MEDIA, GUID `{4d36e96c-e325-11ce-bfc1-08002be10318}`) and install `padmic.inf` for it. A device that is disabled is not loaded: PadDisplay enables the device only while the user has switched the microphone on, and disables it again afterwards.
+
+### Switch it off only when nobody records
+
+Disabling or removing the device while an application records from it makes Windows' audio engine (`audiodg.exe`) refuse the removal. Windows then keeps the device "pending restart": it can be neither enabled nor disabled until a restart, and after the restart it comes back disabled and "not connected" (`pnputil /enable-device` fails with 1167) until the driver is installed again. Reproduced in a VM. So ask the driver first: `PADMIC_STATUS::StreamsRunning` is the number of applications recording right now (open the control device, `IOCTL_PADMIC_GET_STATUS`, close it), and the device should be disabled or removed only when it is 0. PadDisplay waits for that, and gives up the wait when the user switches the microphone on again.
 
 ## Build and sign
 
@@ -32,7 +36,20 @@ See [docs/SIGNING.md](docs/SIGNING.md). Short version: `build.cmd` (VS 2022 Buil
 
 ## Status
 
-Built and tested in a Hyper-V VM with test-signing (installs, loads, records a clean 1 kHz tone, 16-20 ms write-to-capture latency, exclusive open, crash recovery, remove and reinstall). **Not tested:** loading on a PC with Secure Boot (needs the Microsoft signature), Windows 10, drift over more than 60 s, CPU and DPC cost. See [SECURITY.md](SECURITY.md).
+Built and tested in a Hyper-V VM (Windows 11 26100, 2 vCPUs, test-signing). All numbers are the driver's own measurements (`padmic_test`, `PADMIC_STATUS`), not a bare-metal PC:
+
+| What | Result |
+| --- | --- |
+| Idle (device enabled, nobody records) | 0 timer ticks in 30 s: no timer, no thread, nothing scheduled |
+| While an app records | one timer pass per packet, about 100 per second; a pass takes 10-25 us on average (max 0.3-0.7 ms), which is 0.1-0.25 % of one core; a write takes 1-3 us on average |
+| Timer lateness | 0.3 ms on average; max 1.0-2.1 ms in most runs, one 10 ms outlier in about 12 runs of 30 s |
+| Write-to-recording latency | median 18.8 ms (a 20 ms cushion that is refilled at once) |
+| Quality | 999.97 Hz measured for a 1000 Hz tone over 30 s, 0 dropouts in six runs; an earlier 30 s run had two gaps while the VM was busy, cause not proven |
+| Memory | about 8.4 KB (4 allocations) per open stream, 0 after Windows lets the stream go; 150 record sessions: runs equal pauses, no leak |
+| Switching | disable 75 ms, enable 72 ms on average (40 cycles); 25 x record-then-disable and a disable after 100 sessions all worked |
+| Driver Verifier (standard checks + the KMDF verifier) | 34 loads, 33 unloads, 222 allocations, none failed, 0 outstanding at the end, no bugcheck; 30 x record-disable-enable worked |
+
+**Not tested:** loading on a PC with Secure Boot (needs the Microsoft signature), Windows 10, drift over more than 60 s, DPC time on real hardware, the Hardware Lab Kit tests. Driver Verifier's random allocation failures were switched on (10 % and 50 % of the driver's allocations) but injected nothing (0 deliberate failures in 30 allocations), so the allocation-failure paths were only read, not run. Under Driver Verifier alone, one early run had a disable refused by a Windows audio service (no app was recording); thirty-one later attempts did not repeat it and the cause is unknown. See [SECURITY.md](SECURITY.md).
 
 ## License
 
