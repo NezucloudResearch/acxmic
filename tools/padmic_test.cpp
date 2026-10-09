@@ -54,6 +54,9 @@ struct Capture {
 
     void Run() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        // The endpoint to record: part of its name. PADMIC_ENDPOINT overrides "PadDisplay" (e.g. "CABLE Output" for VB-CABLE).
+        wchar_t env[128] = {};
+        const std::wstring wanted = GetEnvironmentVariableW(L"PADMIC_ENDPOINT", env, 128) > 0 && *env ? env : L"PadDisplay";
         IMMDeviceEnumerator* en = nullptr;
         IMMDeviceCollection* list = nullptr;
         IMMDevice* dev = nullptr;
@@ -76,9 +79,9 @@ struct Capture {
             wprintf(L"capture endpoint: %s\n", name.c_str());
             PropVariantClear(&v);
             ps->Release();
-            if (name.find(L"PadDisplay") != std::wstring::npos) dev = d; else d->Release();
+            if (name.find(wanted) != std::wstring::npos) dev = d; else d->Release();
         }
-        if (!dev) { error = "no PadDisplay capture endpoint"; ready = true; return; }
+        if (!dev) { error = "no capture endpoint matching the wanted name"; ready = true; return; }
         hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client));
         if (SUCCEEDED(hr)) hr = client->GetMixFormat(&mix);
         HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -321,6 +324,128 @@ static int Cycles(int n, int holdMs) {
     return failed ? 1 : 0;
 }
 
+// Records for `seconds` and prints when each burst starts (the first loud sample after 0.3 s of quiet) in QueryPerformanceCounter
+// seconds, for measuring a writer in another process: mic_client <pin> <s> <hz> <port> burst prints when it sent each burst.
+static int BurstRec(double seconds) {
+    Capture cap;
+    std::thread ct([&] { cap.Run(); });
+    while (!cap.ready) Sleep(10);
+    if (!cap.error.empty()) { printf("%s\n", cap.error.c_str()); cap.stop = true; ct.join(); return 1; }
+    printf("recording %.0f s\n", seconds);
+    fflush(stdout);
+    Sleep(DWORD(seconds * 1000));
+    cap.stop = true;
+    ct.join();
+    size_t lastLoud = 0, p = 0;
+    bool any = false;
+    int onsets = 0;
+    for (size_t i = 0; i < cap.samples.size(); ++i) {
+        if (std::fabs(cap.samples[i]) < 0.05f) continue;
+        if (!any || double(i - lastLoud) > 0.3 * cap.rate) {
+            while (p + 1 < cap.packetStart.size() && cap.packetStart[p + 1] <= i) ++p;
+            printf("ONSET %.6f\n", cap.packetQpc[p] + double(i - cap.packetStart[p]) / cap.rate);
+            ++onsets;
+        }
+        any = true;
+        lastLoud = i;
+    }
+    printf("onsets %d, packets %zu, flagged silent %zu\n", onsets, cap.packets, cap.silentPackets);
+    return onsets ? 0 : 2;
+}
+
+// The floor of a virtual audio cable: plays a 20 ms tone burst into a playback device (part of its name in PADMIC_RENDER, default
+// "CABLE Input") every second, straight from this process through WASAPI shared mode, and prints when each was handed over, in
+// QueryPerformanceCounter seconds. Record the cable's other end with `burstrec` (PADMIC_ENDPOINT="CABLE Output"). minPeriod: ask
+// for the audio engine's smallest period (IAudioClient3), as PadDisplay does by default.
+static int CableWrite(double seconds, bool minPeriod) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    wchar_t want[128] = {};
+    const std::wstring wanted = GetEnvironmentVariableW(L"PADMIC_RENDER", want, 128) > 0 ? want : L"CABLE Input";
+    IMMDeviceEnumerator* en = nullptr;
+    IMMDeviceCollection* list = nullptr;
+    IMMDevice* dev = nullptr;
+    CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en));
+    en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &list);
+    UINT n = 0;
+    list->GetCount(&n);
+    for (UINT i = 0; i < n && !dev; ++i) {
+        IMMDevice* d = nullptr;
+        list->Item(i, &d);
+        IPropertyStore* ps = nullptr;
+        d->OpenPropertyStore(STGM_READ, &ps);
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        ps->GetValue(PKEY_Device_FriendlyName, &v);
+        if (v.vt == VT_LPWSTR && std::wstring(v.pwszVal).find(wanted) != std::wstring::npos) dev = d; else d->Release();
+        PropVariantClear(&v);
+        ps->Release();
+    }
+    if (!dev) { printf("no playback device matching the wanted name\n"); return 1; }
+    IAudioClient* client = nullptr;
+    dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client));
+    WAVEFORMATEX* mix = nullptr;
+    client->GetMixFormat(&mix);
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    bool ok = false;
+    if (minPeriod) {
+        IAudioClient3* c3 = nullptr;
+        if (SUCCEEDED(client->QueryInterface(IID_PPV_ARGS(&c3)))) {
+            UINT32 def = 0, fund = 0, mn = 0, mx = 0;
+            if (SUCCEEDED(c3->GetSharedModeEnginePeriod(mix, &def, &fund, &mn, &mx)) && SUCCEEDED(c3->InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, mn, mix, nullptr))) {
+                ok = true;
+                printf("period %u frames (default %u)\n", mn, def);
+            }
+        }
+    }
+    if (!ok && FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 200000, 0, mix, nullptr))) {
+        // a failed InitializeSharedAudioStream leaves the client unusable: take a new one
+        client->Release();
+        dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client));
+        if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 200000, 0, mix, nullptr))) { printf("cannot open the device\n"); return 1; }
+    }
+    UINT32 frames = 0;
+    client->SetEventHandle(ev);
+    client->GetBufferSize(&frames);
+    IAudioRenderClient* render = nullptr;
+    client->GetService(IID_PPV_ARGS(&render));
+    const bool isFloat = mix->wBitsPerSample == 32;
+    printf("format %lu Hz, %u ch, %s, buffer %u frames\n", mix->nSamplesPerSec, mix->nChannels, isFloat ? "float" : "16-bit", frames);
+    DWORD task = 0;
+    AvSetMmThreadCharacteristicsW(L"Pro Audio", &task);
+    client->Start();
+    const double rate = double(mix->nSamplesPerSec);
+    const double stop = Qpc() + seconds;
+    uint64_t pos = 0; // frames handed over so far
+    const uint64_t perSecond = uint64_t(rate), burstLen = uint64_t(rate * 0.02);
+    uint64_t nextBurst = uint64_t(rate); // first burst after 1 s
+    while (Qpc() < stop) {
+        if (WaitForSingleObject(ev, 200) != WAIT_OBJECT_0) continue;
+        UINT32 padding = 0;
+        client->GetCurrentPadding(&padding);
+        const UINT32 room = frames - padding;
+        BYTE* data = nullptr;
+        if (room == 0 || FAILED(render->GetBuffer(room, &data))) continue;
+        bool burstHere = false;
+        for (UINT32 f = 0; f < room; ++f) {
+            const uint64_t at = pos + f;
+            const bool inBurst = at >= nextBurst && at < nextBurst + burstLen;
+            if (at == nextBurst) burstHere = true;
+            const float s = inBurst ? float(std::sin(2 * 3.14159265358979 * 1000.0 * double(at - nextBurst) / rate) * 0.5) : 0.f;
+            for (UINT32 c = 0; c < mix->nChannels; ++c) {
+                if (isFloat) reinterpret_cast<float*>(data)[size_t(f) * mix->nChannels + c] = s;
+                else reinterpret_cast<int16_t*>(data)[size_t(f) * mix->nChannels + c] = int16_t(s * 32767);
+            }
+        }
+        if (burstHere) printf("BURST %.6f\n", Qpc());
+        render->ReleaseBuffer(room, 0);
+        pos += room;
+        if (pos >= nextBurst + burstLen) nextBurst += perSecond;
+        if (burstHere) fflush(stdout);
+    }
+    client->Stop();
+    return 0;
+}
+
 int main(int argc, char** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     std::string mode = argc > 1 ? argv[1] : "";
@@ -355,7 +480,9 @@ int main(int argc, char** argv) {
     if (mode == "record") return SelfTest(argc > 2 ? atof(argv[2]) : 10, argc > 3 ? atof(argv[3]) : 1000, true);
     if (mode == "selftest") return SelfTest(argc > 2 ? atof(argv[2]) : 10, argc > 3 ? atof(argv[3]) : 1000);
     if (mode == "latency") return Latency(argc > 2 ? atoi(argv[2]) : 5);
+    if (mode == "burstrec") return BurstRec(argc > 2 ? atof(argv[2]) : 10);
+    if (mode == "cablewrite") return CableWrite(argc > 2 ? atof(argv[2]) : 10, argc > 3 && std::string(argv[3]) == "min");
     if (mode == "cycles") return Cycles(argc > 2 ? atoi(argv[2]) : 20, argc > 3 ? atoi(argv[3]) : 500);
-    printf("usage: padmic_test status | open | hold <s> | selftest <s> <hz> | latency <n> | cycles <n> <ms>\n");
+    printf("usage: padmic_test status | open | hold <s> | selftest <s> <hz> | latency <n> | cycles <n> <ms> | burstrec <s>\n");
     return 64;
 }

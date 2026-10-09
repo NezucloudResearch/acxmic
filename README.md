@@ -2,7 +2,7 @@
 
 A virtual microphone driver for Windows: a small KMDF + ACX (Audio Class Extensions) kernel driver that adds one recording device, **"Microphone (PadDisplay Virtual Microphone)"**, to Windows. Any program that is allowed to open the control device can play 48 kHz mono 16-bit audio into it, and every app that records from that microphone hears it.
 
-It was written for [PadDisplay](https://github.com/NezucloudResearch/PadDisplay), which plays a tablet's microphone into the PC this way, and is kept in its own repository so that it can be built, signed and released on its own. It has no dependency on PadDisplay.
+It was written for [PadDisplay](https://github.com/NezucloudResearch/PadDisplay), which plays a tablet's microphone into the PC this way, and is kept in its own repository so that it can be built, signed and released on its own. It has no dependency on PadDisplay. PadDisplay uses it only on a PC where Windows will load it (a Microsoft-signed build, or test-signing on); everywhere else PadDisplay falls back to VB-CABLE, because this repository has no Microsoft signature yet.
 
 - **Latency:** the driver adds about 20 ms (a 20 ms cushion that is refilled at once, never more than 100 ms; the oldest audio is dropped rather than letting a late source build a delay).
 - **Zero cost when idle:** the stream timer runs only while an app records.
@@ -31,7 +31,7 @@ See [docs/SIGNING.md](docs/SIGNING.md). Short version: `build.cmd` (VS 2022 Buil
 | --- | --- |
 | `driver/` | The driver: `driver.cpp` (DriverEntry, control device), `circuit.cpp` (ACX circuit), `stream.cpp` (timer-driven stream engine), `ring.h` (the buffer), `padmic.inx` (INF template) |
 | `include/padmic_public.h` | Shared with user mode: device path, IOCTLs, `PADMIC_STATUS` |
-| `tools/` | `padmic_test`: writes a tone, records it back through WASAPI, measures frequency, gaps and latency |
+| `tools/` | `padmic_test`: writes a tone, records it back through WASAPI, measures frequency, gaps and latency; `burstrec` and `cablewrite` time a writer in another process or a virtual audio cable (`PADMIC_ENDPOINT` picks the recording device) |
 | `build.cmd`, `sign-test.cmd`, `import-test-cert.cmd`, `submission.cmd` | Build, test-sign, trust the test certificate (in a VM), make the Partner Center submission |
 
 ## Status
